@@ -1,0 +1,123 @@
+# MeshIRCd
+
+A federated IRC server for hobbyist networks. Modern protocol internals, classic IRC interface.
+
+## What It Is
+
+MeshIRCd is a from-scratch IRC server in Go that federates with other MeshIRCd servers over a custom S2S protocol. Clients connect with any standard IRC client. Servers find each other via a shared GitHub repository.
+
+## What Makes It Different
+
+**JSON-LD S2S Protocol**  
+Server-to-server communication uses JSON-LD over TLS. Events are signed with Ed25519, ordered with Lamport clocks, and deduplicated across the mesh. No TS6, no services, no legacy baggage.
+
+**GitHub-Based Discovery**  
+Servers find peers by polling a `servers.json` file in a GitHub repo. Join the network with a PR. Leave by deleting your entry. Git history is your audit log.
+
+**DID Identity**  
+Users can attach Decentralized Identifiers to their presence. Prove you control `did:key:...` or `did:web:example.com`. Identity propagates across the federation and shows in WHOIS.
+
+**IRCv3 Features**  
+SASL EXTERNAL (TLS client certs mapped to DIDs), message IDs, echo-message, chathistory, labeled-response. Modern client UX on a modern server.
+
+**Soft Mesh Topology**  
+Servers connect to all peers they can reach. Messages flood with deduplication. No spanning tree, no single point of failure. Partitions heal automatically.
+
+## Architecture
+
+```
+┌──────────────┐    JSON-LD/TLS     ┌──────────────┐
+│  MeshIRCd A  │◄──────────────────►│  MeshIRCd B  │
+└──────┬───────┘                    └───────┬──────┘
+       │ IRC                                │ IRC
+       ▼                                    ▼
+   ┌───────┐                            ┌───────┐
+   │ irssi │                            │ weechat│
+   └───────┘                            └───────┘
+```
+
+- **C2S**: Standard IRC protocol + IRCv3 extensions
+- **S2S**: JSON-LD messages, Ed25519 signatures, Lamport ordering
+- **Discovery**: GitHub repo with `servers.json`
+
+## Quick Start
+
+```bash
+# Generate keypair and server config
+meshircd --init --hostname irc.example.com --port 6697 --admin you@example.com
+
+# Start the server
+meshircd \
+  --hostname irc.example.com \
+  --port 6697 \
+  --cert server.crt \
+  --key server.key \
+  --discovery-url https://raw.githubusercontent.com/your-network/config/main/servers.json
+```
+
+## Joining a Network
+
+1. Run `meshirc --init` to generate your server block
+2. Fork the network's config repo
+3. Add your block to `servers.json`
+4. Open a PR
+5. Wait for merge
+6. Start your server — peers connect within 5 minutes
+
+## Configuration
+
+**servers.json** (in your network's GitHub repo):
+
+```json
+{
+  "network": "MyNetwork",
+  "servers": {
+    "irc.example.com": {
+      "port": 6697,
+      "pubkey": "ed25519:MCowBQYDK2VwAyEA...",
+      "admin": "admin@example.com"
+    }
+  }
+}
+```
+
+## Identity
+
+Users can attach DIDs to their IRC presence:
+
+```
+/quote IDENTITY CHALLENGE
+/quote METADATA * SET identity :{"@context":[...],"id":"did:key:z6Mk...","proof":{...}}
+```
+
+Identity shows in WHOIS and propagates across the federation.
+
+## Specs
+
+| Document | Description |
+|----------|-------------|
+| [S2S.md](S2S.md) | Server-to-server federation protocol |
+| [IDENTITY.md](IDENTITY.md) | DID-based identity extension |
+| [IRCV3.md](IRCV3.md) | IRCv3 client protocol extensions |
+| [DISCOVERY.md](DISCOVERY.md) | GitHub-based peer discovery |
+
+## Building
+
+```bash
+go build -o meshircd .
+```
+
+Requires Go 1.21+.
+
+## Design Principles
+
+- **TLS only** — no plaintext, no STARTTLS upgrade dance
+- **No services** — identity is DIDs, not NickServ
+- **No linking complexity** — soft mesh, not spanning tree
+- **Git as coordination** — PRs for trust decisions, history for audit
+- **JSON-LD for extensibility** — add contexts, not protocol versions
+- **Existing clients work** — IRCv3 where it helps, standard IRC everywhere
+
+## License
+
+AGPL-3.0

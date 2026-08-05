@@ -1,0 +1,5 @@
+meshircd
+ircd
+*.key
+*.crt
+*.pem
