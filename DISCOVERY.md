@@ -235,7 +235,7 @@ Or via config file:
 
 ```yaml
 discovery:
-  url: https://raw.githubusercontent.com/coolnetwork/config/main/servers.json
+  url: https://raw.githubusercontent.com/MarkAtwood/meshircd-network/main/servers.json
   poll: 5m
   cache: /var/lib/ircd/servers.json
 ```
@@ -612,7 +612,7 @@ meshircd \
   --port 6697 \
   --cert server.crt \
   --key server.key \
-  --discovery-url https://raw.githubusercontent.com/coolnetwork/config/main/servers.json
+  --discovery-url https://raw.githubusercontent.com/MarkAtwood/meshircd-network/main/servers.json
 
 # 4. Verify peers connected
 meshircdctl status

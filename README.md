@@ -52,7 +52,7 @@ meshircd \
   --port 6697 \
   --cert server.crt \
   --key server.key \
-  --discovery-url https://raw.githubusercontent.com/your-network/config/main/servers.json
+  --discovery-url https://raw.githubusercontent.com/MarkAtwood/meshircd-network/main/servers.json
 ```
 
 ## Joining a Network
