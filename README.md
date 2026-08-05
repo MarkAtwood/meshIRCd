@@ -109,6 +109,62 @@ go build -o meshircd .
 
 Requires Go 1.21+.
 
+## Docker
+
+```bash
+# Build
+docker build -t meshircd .
+
+# Initialize (generates keys, outputs servers.json block)
+docker run --rm -v meshircd-data:/data \
+  -e MESHIRCD_HOSTNAME=irc.example.com \
+  -e MESHIRCD_ADMIN=you@example.com \
+  meshircd --init
+
+# Run
+docker run -d --name meshircd \
+  -v meshircd-data:/data \
+  -p 6697:6697 \
+  -e MESHIRCD_HOSTNAME=irc.example.com \
+  -e MESHIRCD_DISCOVERY_URL=https://raw.githubusercontent.com/MarkAtwood/meshircd-network/main/servers.json \
+  meshircd
+```
+
+Environment variables:
+- `MESHIRCD_HOSTNAME` — server hostname (required)
+- `MESHIRCD_DISCOVERY_URL` — servers.json URL for federation
+- `MESHIRCD_NETWORK` — network name (default: MeshIRCd)
+- `MESHIRCD_ADMIN` — admin email (for init)
+- `MESHIRCD_DATA` — data directory (default: /data)
+
+Keys persist in the `/data` volume. First run with `--init`, PR the output block to the network repo, then run normally.
+
+## Running Behind a Reverse Proxy
+
+MeshIRCd can run behind Caddy or another proxy using TCP passthrough. TLS must terminate at MeshIRCd (not the proxy) so federation peers see the correct certificate.
+
+**Caddy with layer4 plugin:**
+
+```
+# Caddyfile
+{
+  layer4 {
+    :6697 {
+      route {
+        proxy meshircd-backend:6697
+      }
+    }
+  }
+}
+```
+
+Build Caddy with the layer4 plugin:
+```bash
+xcaddy build --with github.com/mholt/caddy-l4
+```
+
+This works well for homelab setups where MeshIRCd runs on an internal server (e.g., via Tailscale) and Caddy runs on a public VPC.
+
 ## Design Principles
 
 - **TLS only** — no plaintext, no STARTTLS upgrade dance

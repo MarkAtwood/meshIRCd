@@ -1,0 +1,7 @@
+*.md
+*.key
+*.crt
+*.pem
+.git
+.gitignore
+meshircd

@@ -2556,13 +2556,18 @@ func matchMask(s, mask string) bool {
 }
 
 // runInit handles the --init mode: generates Ed25519 keypair and self-signed TLS cert
-func runInit(hostname, admin, addr string) error {
-	const keyFile = "server.key"
-	const certFile = "server.crt"
+func runInit(hostname, admin, addr, dataPath string) error {
+	keyFile := dataPath + "/server.key"
+	certFile := dataPath + "/server.crt"
+
+	// Ensure data directory exists
+	if err := os.MkdirAll(dataPath, 0755); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
 
 	// Check if key already exists
 	if _, err := os.Stat(keyFile); err == nil {
-		return fmt.Errorf("server.key already exists; remove it first to regenerate")
+		return fmt.Errorf("%s already exists; remove it first to regenerate", keyFile)
 	}
 
 	// Generate Ed25519 keypair
@@ -2661,12 +2666,21 @@ func runInit(hostname, admin, addr string) error {
 	return nil
 }
 
+// envOrFlag returns the environment variable value if set, otherwise the flag default.
+func envOrFlag(envName, flagVal string) string {
+	if v := os.Getenv(envName); v != "" {
+		return v
+	}
+	return flagVal
+}
+
 func main() {
 	addr := flag.String("addr", ":6697", "Listen address")
-	certFile := flag.String("cert", "cert.pem", "TLS certificate file")
-	keyFile := flag.String("key", "key.pem", "TLS key file")
-	name := flag.String("name", "irc.local", "Server name")
-	network := flag.String("network", "LocalNet", "Network name")
+	certFile := flag.String("cert", "", "TLS certificate file")
+	keyFile := flag.String("key", "", "TLS key file")
+	dataDir := flag.String("data", "", "Data directory for keys and cache")
+	name := flag.String("name", "", "Server name")
+	network := flag.String("network", "", "Network name")
 	password := flag.String("password", "", "Server password (optional)")
 	operPass := flag.String("operpass", "", "Operator password (optional)")
 	motdFile := flag.String("motd", "", "MOTD file (optional)")
@@ -2683,15 +2697,46 @@ func main() {
 
 	flag.Parse()
 
+	// Apply env var fallbacks
+	dataPath := envOrFlag("MESHIRCD_DATA", *dataDir)
+	if dataPath == "" {
+		if _, err := os.Stat("/data"); err == nil {
+			dataPath = "/data" // container default
+		} else {
+			dataPath = "." // local default
+		}
+	}
+	serverName := envOrFlag("MESHIRCD_HOSTNAME", *name)
+	if serverName == "" {
+		serverName = "irc.local"
+	}
+	networkName := envOrFlag("MESHIRCD_NETWORK", *network)
+	if networkName == "" {
+		networkName = "MeshIRCd"
+	}
+	discURL := envOrFlag("MESHIRCD_DISCOVERY_URL", *discoveryURL)
+	discToken := envOrFlag("MESHIRCD_DISCOVERY_TOKEN", *discoveryToken)
+
+	certPath := *certFile
+	if certPath == "" {
+		certPath = dataPath + "/server.crt"
+	}
+	keyPath := *keyFile
+	if keyPath == "" {
+		keyPath = dataPath + "/server.key"
+	}
+
 	// Handle init mode
 	if *initMode {
-		if err := runInit(*initHostname, *initAdmin, *addr); err != nil {
+		initHost := envOrFlag("MESHIRCD_HOSTNAME", *initHostname)
+		initAdm := envOrFlag("MESHIRCD_ADMIN", *initAdmin)
+		if err := runInit(initHost, initAdm, *addr, dataPath); err != nil {
 			log.Fatalf("Init failed: %v", err)
 		}
 		return
 	}
 
-	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		log.Fatalf("Failed to load TLS cert: %v", err)
 	}
@@ -2708,7 +2753,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	server := newServer(*name, *network, *password, *operPass)
+	server := newServer(serverName, networkName, *password, *operPass)
 
 	if *motdFile != "" {
 		data, err := os.ReadFile(*motdFile)
@@ -2718,27 +2763,26 @@ func main() {
 	}
 
 	// Initialize federation if discovery URL is configured
-	if *discoveryURL != "" {
+	if discURL != "" {
 		cachePath := *discoveryCache
 		if cachePath == "" {
-			homeDir, _ := os.UserHomeDir()
-			cachePath = homeDir + "/.ircd/servers.json"
+			cachePath = dataPath + "/servers.json"
 		}
 
-		discovery := NewDiscovery(*discoveryURL, cachePath, *discoveryToken)
+		discovery := NewDiscovery(discURL, cachePath, discToken)
 
 		// Extract Ed25519 private key from certificate
 		edPrivKey, ok := cert.PrivateKey.(ed25519.PrivateKey)
 		if !ok {
 			log.Printf("Federation requires Ed25519 key (got %T); federation disabled", cert.PrivateKey)
 		} else {
-			fm := NewFederationManager(server, *name, edPrivKey, cert, discovery)
+			fm := NewFederationManager(server, serverName, edPrivKey, cert, discovery)
 			server.federation = fm
 
 			if err := fm.Start(); err != nil {
 				log.Printf("Federation failed to start: %v (continuing without federation)", err)
 			} else {
-				log.Printf("Federation enabled, discovery URL: %s", *discoveryURL)
+				log.Printf("Federation enabled, discovery URL: %s", discURL)
 				defer fm.Stop()
 			}
 		}
