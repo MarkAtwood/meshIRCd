@@ -148,6 +148,38 @@ Close.
 
 With the 'd' for daemon. Traditional.
 
+## Containerization
+
+> "i want people to be able to just run this containerized"
+
+Added:
+- Dockerfile (multi-stage, 15 lines)
+- Environment variables: `MESHIRCD_HOSTNAME`, `MESHIRCD_DISCOVERY_URL`, `MESHIRCD_NETWORK`, `MESHIRCD_ADMIN`
+- `/data` volume for keys and cache
+- Init mode generates keys and outputs servers.json block
+
+The flow: `docker run --init` → PR the output → `docker run` with discovery URL.
+
+## The Network Repo
+
+> "we also need to create a github repo for the meshircd network discovery process"
+
+Created [meshircd-network](https://github.com/MarkAtwood/meshircd-network) — the actual servers.json that servers poll. Join with a PR. Step-by-step instructions in the README.
+
+Two repos now:
+- **meshIRCd** — the code
+- **meshircd-network** — the network membership
+
+Git as coordination layer, all the way down.
+
+## Running Behind Caddy
+
+> "can this run behind a caddy? because my personal setup is running containers on my homeserver, and using tailscale to get them to a vpc on the internet running caddy"
+
+Yes, with TCP passthrough. TLS terminates at MeshIRCd, not Caddy, so federation peers see the right cert. Caddy's `layer4` plugin routes by SNI without touching the TLS handshake.
+
+One port (6697) for both clients and S2S. Keep it simple.
+
 ## What We Built
 
 A federated IRC server that:
@@ -190,12 +222,17 @@ meshircd/
 ├── identity.go      # DID parsing, proof verification
 ├── ircv3.go         # SASL, echo-message, labeled-response
 ├── chathistory.go   # Message storage, CHATHISTORY commands
+├── Dockerfile       # Multi-stage build
 ├── S2S.md           # Federation protocol spec
 ├── IDENTITY.md      # DID identity spec
 ├── IRCV3.md         # IRCv3 extensions spec
 ├── DISCOVERY.md     # GitHub discovery spec
 ├── README.md        # What it is
 └── VIBED.md         # How it happened
+
+meshircd-network/
+├── servers.json     # Network membership
+└── README.md        # How to join
 ```
 
 ## License
