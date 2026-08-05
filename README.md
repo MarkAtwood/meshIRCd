@@ -57,7 +57,7 @@ meshircd \
 
 ## Joining a Network
 
-1. Run `meshirc --init` to generate your server block
+1. Run `meshircd --init` to generate your server block
 2. Fork the network's config repo
 3. Add your block to `servers.json`
 4. Open a PR
