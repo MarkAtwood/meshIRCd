@@ -3,3 +3,9 @@ ircd
 *.key
 *.crt
 *.pem
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
