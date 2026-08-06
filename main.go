@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
@@ -2872,10 +2874,11 @@ func matchMask(s, mask string) bool {
 	return mi == len(mask)
 }
 
-// runInit handles the --init mode: generates Ed25519 keypair and self-signed TLS cert
+// runInit handles the --init mode: generates ECDSA for TLS + Ed25519 for federation
 func runInit(hostname, admin, addr, dataPath string) error {
 	keyFile := dataPath + "/server.key"
 	certFile := dataPath + "/server.crt"
+	fedKeyFile := dataPath + "/fed.key"
 
 	// Ensure data directory exists
 	if err := os.MkdirAll(dataPath, 0755); err != nil {
@@ -2887,26 +2890,45 @@ func runInit(hostname, admin, addr, dataPath string) error {
 		return fmt.Errorf("%s already exists; remove it first to regenerate", keyFile)
 	}
 
-	// Generate Ed25519 keypair
-	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	// Generate ECDSA keypair for TLS (P-256 for macOS compatibility)
+	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("failed to generate ECDSA keypair: %w", err)
+	}
+
+	// Save ECDSA private key
+	ecdsaKeyBytes, err := x509.MarshalPKCS8PrivateKey(ecdsaKey)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ECDSA key: %w", err)
+	}
+	ecdsaKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: ecdsaKeyBytes,
+	})
+	if err := os.WriteFile(keyFile, ecdsaKeyPEM, 0600); err != nil {
+		return fmt.Errorf("failed to write server.key: %w", err)
+	}
+
+	// Generate Ed25519 keypair for federation signing
+	edPubKey, edPrivKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return fmt.Errorf("failed to generate Ed25519 keypair: %w", err)
 	}
 
-	// Save private key to server.key in PEM format
-	privKeyBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
+	// Save Ed25519 private key
+	edKeyBytes, err := x509.MarshalPKCS8PrivateKey(edPrivKey)
 	if err != nil {
-		return fmt.Errorf("failed to marshal private key: %w", err)
+		return fmt.Errorf("failed to marshal Ed25519 key: %w", err)
 	}
-	privKeyPEM := pem.EncodeToMemory(&pem.Block{
+	edKeyPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "PRIVATE KEY",
-		Bytes: privKeyBytes,
+		Bytes: edKeyBytes,
 	})
-	if err := os.WriteFile(keyFile, privKeyPEM, 0600); err != nil {
-		return fmt.Errorf("failed to write server.key: %w", err)
+	if err := os.WriteFile(fedKeyFile, edKeyPEM, 0600); err != nil {
+		return fmt.Errorf("failed to write fed.key: %w", err)
 	}
 
-	// Generate self-signed TLS certificate
+	// Generate self-signed TLS certificate with ECDSA key
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
 		return fmt.Errorf("failed to generate serial number: %w", err)
@@ -2936,7 +2958,7 @@ func runInit(hostname, admin, addr, dataPath string) error {
 		template.IPAddresses = []net.IP{ip}
 	}
 
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, pubKey, privKey)
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &ecdsaKey.PublicKey, ecdsaKey)
 	if err != nil {
 		return fmt.Errorf("failed to create certificate: %w", err)
 	}
@@ -2961,7 +2983,7 @@ func runInit(hostname, admin, addr, dataPath string) error {
 		displayHostname = "localhost"
 	}
 
-	pubKeyBase64 := base64.StdEncoding.EncodeToString(pubKey)
+	pubKeyBase64 := base64.StdEncoding.EncodeToString(edPubKey)
 
 	serverEntry := map[string]interface{}{
 		displayHostname: map[string]interface{}{
@@ -2976,7 +2998,7 @@ func runInit(hostname, admin, addr, dataPath string) error {
 		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
 
-	log.Printf("Generated server.key and server.crt")
+	log.Printf("Generated server.key (ECDSA/TLS), server.crt, and fed.key (Ed25519/federation)")
 	log.Printf("Add to servers.json:")
 	fmt.Println(string(jsonOut))
 
@@ -3006,6 +3028,7 @@ func main() {
 	discoveryURL := flag.String("discovery-url", "", "URL of servers.json for federation (optional)")
 	discoveryCache := flag.String("discovery-cache", "", "Local cache path for servers.json")
 	discoveryToken := flag.String("discovery-token", "", "GitHub API token for private repos (optional)")
+	fedKeyFile := flag.String("fed-key", "", "Ed25519 private key for federation signing")
 
 	// Init mode flags
 	initMode := flag.Bool("init", false, "Initialize server keys and certificate")
@@ -3100,11 +3123,33 @@ func main() {
 
 		discovery := NewDiscovery(discURL, cachePath, discToken)
 
-		// Extract Ed25519 private key from certificate
-		edPrivKey, ok := cert.PrivateKey.(ed25519.PrivateKey)
-		if !ok {
-			log.Printf("Federation requires Ed25519 key (got %T); federation disabled", cert.PrivateKey)
+		// Load Ed25519 federation key (separate from TLS cert)
+		fedKeyPath := *fedKeyFile
+		if fedKeyPath == "" {
+			fedKeyPath = dataPath + "/fed.key"
+		}
+
+		var edPrivKey ed25519.PrivateKey
+		fedKeyData, err := os.ReadFile(fedKeyPath)
+		if err != nil {
+			log.Printf("Federation key not found at %s; federation disabled", fedKeyPath)
 		} else {
+			block, _ := pem.Decode(fedKeyData)
+			if block == nil {
+				log.Printf("Federation key invalid PEM; federation disabled")
+			} else {
+				key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+				if err != nil {
+					log.Printf("Federation key parse error: %v; federation disabled", err)
+				} else if k, ok := key.(ed25519.PrivateKey); !ok {
+					log.Printf("Federation key not Ed25519 (got %T); federation disabled", key)
+				} else {
+					edPrivKey = k
+				}
+			}
+		}
+
+		if edPrivKey != nil {
 			fm := NewFederationManager(server, serverName, edPrivKey, cert, discovery)
 			server.federation = fm
 
