@@ -672,7 +672,30 @@ func (ev evMessage) handle(ch *Channel) {
 func (ev evMode) handle(ch *Channel) {
 	c := ev.client
 
-	if ev.modeStr == "" {
+	// Treat empty mode string or just +/- (no actual mode letters) as a query
+	// Also treat list modes (b, e, I) without params as queries
+	isQuery := true
+	for _, m := range ev.modeStr {
+		if m != '+' && m != '-' {
+			isQuery = false
+			break
+		}
+	}
+	// Check for list mode queries: "b", "e", "I" with no parameters
+	isListQuery := false
+	if len(ev.params) == 0 {
+		listOnly := true
+		for _, m := range ev.modeStr {
+			if m != 'b' && m != 'e' && m != 'I' && m != '+' && m != '-' {
+				listOnly = false
+				break
+			}
+		}
+		if listOnly && ev.modeStr != "" {
+			isListQuery = true
+		}
+	}
+	if isQuery {
 		// query
 		var modes string
 		var args []string
@@ -699,7 +722,28 @@ func (ev evMode) handle(ch *Channel) {
 		return
 	}
 
+	// Handle list mode queries (b, e, I without params) - anyone can query these
+	if isListQuery {
+		for _, m := range ev.modeStr {
+			switch m {
+			case 'b':
+				for _, ban := range ch.bans {
+					c.SendNumeric(RPL_BANLIST, fmt.Sprintf("%s %s", ch.name, ban.mask))
+				}
+				c.SendNumeric(RPL_ENDOFBANLIST, fmt.Sprintf("%s :End of channel ban list", ch.name))
+			case 'e':
+				// Exception list not implemented yet, just send end
+				c.SendNumeric(RPL_ENDOFEXCEPTLIST, fmt.Sprintf("%s :End of channel exception list", ch.name))
+			case 'I':
+				// Invite exception list not implemented yet, just send end
+				c.SendNumeric(RPL_ENDOFINVITELIST, fmt.Sprintf("%s :End of channel invite list", ch.name))
+			}
+		}
+		return
+	}
+
 	if !ch.isOp(c) {
+		log.Printf("DEBUG 482 MODE: nick=%s chan=%s modeStr=%q params=%v", c.Nick(), ch.name, ev.modeStr, ev.params)
 		c.SendNumeric(ERR_CHANOPRIVSNEEDED, fmt.Sprintf("%s :You're not channel operator", ch.name))
 		return
 	}
@@ -857,6 +901,7 @@ func (ev evTopic) handle(ch *Channel) {
 	}
 
 	if ch.modes['t'] && !ch.isOp(c) {
+		log.Printf("DEBUG 482 TOPIC: nick=%s chan=%s", c.Nick(), ch.name)
 		c.SendNumeric(ERR_CHANOPRIVSNEEDED, fmt.Sprintf("%s :You're not channel operator", ch.name))
 		return
 	}
@@ -877,6 +922,7 @@ func (ev evKick) handle(ch *Channel) {
 	c := ev.client
 
 	if !ch.isOp(c) {
+		log.Printf("DEBUG 482 KICK: nick=%s chan=%s", c.Nick(), ch.name)
 		c.SendNumeric(ERR_CHANOPRIVSNEEDED, fmt.Sprintf("%s :You're not channel operator", ch.name))
 		return
 	}
@@ -913,6 +959,7 @@ func (ev evInvite) handle(ch *Channel) {
 	}
 
 	if ch.modes['i'] && !ch.isOp(c) {
+		log.Printf("DEBUG 482 INVITE: nick=%s chan=%s", c.Nick(), ch.name)
 		c.SendNumeric(ERR_CHANOPRIVSNEEDED, fmt.Sprintf("%s :You're not channel operator", ch.name))
 		return
 	}

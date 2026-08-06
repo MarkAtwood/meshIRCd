@@ -1,0 +1,4 @@
+local_metadata.json
+*.tmp
+merge_slot.json
+repo_mtime.json
