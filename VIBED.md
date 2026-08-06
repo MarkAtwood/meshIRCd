@@ -214,11 +214,11 @@ Some things that emerged:
 
 ```
 meshircd/
-├── main.go          # Core IRC server + IRCv3 + identity
+├── main.go          # Core IRC server + IRCv3 + identity + flood control
 ├── s2s.go           # JSON-LD types, Lamport clocks, signatures
-├── federation.go    # Peer manager, routing, state sync
+├── federation.go    # Peer manager, routing, state sync, network MOTD
 ├── peer.go          # TLS connections, reconnect
-├── discovery.go     # servers.json, GitHub fetch
+├── discovery.go     # servers.json + motd.txt fetch from GitHub
 ├── identity.go      # DID parsing, proof verification
 ├── ircv3.go         # SASL, echo-message, labeled-response
 ├── chathistory.go   # Message storage, CHATHISTORY commands
@@ -231,9 +231,136 @@ meshircd/
 └── VIBED.md         # How it happened
 
 meshircd-network/
-├── servers.json     # Network membership
+├── servers.json     # Network membership (pubkeys, ports, admins)
+├── motd.txt         # Network-wide MOTD
 └── README.md        # How to join
 ```
+
+## Day Two: Production
+
+> "ok, look at my ~/.ssh/config and recognize my dokr vm and my caddy vps... i think you also have cli or rest access to my dns provider for reviewcommit.com"
+
+Time to deploy for real. The setup: container on dokr (homeserver), Caddy on joumon (VPS), Tailscale between them, DNS at irc.reviewcommit.com.
+
+Built Caddy with layer4 plugin on joumon for TCP passthrough. TLS terminates at MeshIRCd, not Caddy — peers need to see the right cert.
+
+First connection attempt from macOS Textual: TLS handshake failed. Error -9824.
+
+> "so this is a macos fuckup"
+
+Yes. macOS Secure Transport doesn't support Ed25519 TLS certificates. Only ECDSA and RSA.
+
+Originally used Ed25519 for everything — TLS and federation signing — because it's cleaner. But Apple had other plans.
+
+**Dual-key solution**: ECDSA P-256 for TLS (macOS compatible), Ed25519 for federation signing. Two keys, two purposes.
+
+```go
+// runInit now generates both:
+// - server.key (ECDSA) + server.crt for TLS
+// - fed.key (Ed25519) for federation signing
+```
+
+New flag: `--fed-key` for the federation key path.
+
+Federation re-enabled. Clients connect. Done.
+
+## The 482 Bug
+
+> "every time I join a channel, I get 'You're not a channel operator'"
+
+Textual (and irssi) send `MODE #channel b` on join to query the ban list. The server was treating any MODE with letters as a mode change requiring op.
+
+The fix: detect list-only queries (b/e/I without parameters) and return the list instead of 482.
+
+```go
+// MODE #channel b   → return ban list (RPL_BANLIST)
+// MODE #channel +b *!*@evil.com → requires op
+isListQuery := len(params) == 0 && containsOnlyListModes(modeStr)
+```
+
+One if statement. Bug gone.
+
+## Quality of Life
+
+> "IP addresses are kinda bullshit in IRC now. maybe everyone is 'cloaked'?"
+
+Yes. Everyone shows `@irc.reviewcommit.com` instead of their IP. One line: set hostname to server name on connect.
+
+> "what are some interesting 'extensions' that irssi does?"
+
+MONITOR, WATCH, AWAY-NOTIFY. Friend online notifications.
+
+> "implement all these"
+
+MONITOR/WATCH: maps on the client, check on connect/disconnect.
+AWAY-NOTIFY: broadcast away changes to shared channels.
+
+> "i want a channel named '##' that everyone autojoins on connect"
+
+One line after registration complete: join ##.
+
+> "talk to me about flood control"
+
+Token bucket. 5 messages/second, burst 10. Over limit = silent drop.
+
+```go
+// ponytail: token bucket, 15 lines
+c.floodTokens += elapsed.Seconds() * 5.0
+if c.floodTokens > 10 { c.floodTokens = 10 }
+if c.floodTokens < 1 { continue }
+c.floodTokens--
+```
+
+## Network MOTD
+
+> "yay it works. ok, 'MOTD File is missing'"
+
+Two-level MOTD: network MOTD from the GitHub repo (fetched with discovery), local MOTD from file. Users see both.
+
+```
+=== MeshIRCd Network ===
+Welcome to MeshIRCd Network
+A federated IRC network with no central authority.
+...
+=== irc.reviewcommit.com ===
+[local MOTD if configured]
+```
+
+## What's Running
+
+`irc.reviewcommit.com:6697` — the first node.
+
+```
+dokr (homeserver)
+  └── meshircd container
+        ├── ECDSA cert (TLS)
+        ├── Ed25519 key (federation)
+        └── polls GitHub for peers
+              ↓ Tailscale
+joumon (VPS)
+  └── Caddy layer4
+        └── TCP passthrough to dokr
+              ↓
+Internet (:6697)
+```
+
+Connect with any IRC client. Join ##.
+
+## Remaining Work
+
+- **File transfer**: HTTP upload for modern DCC. Beaded, not urgent.
+
+## What We Learned
+
+**Apple breaks everything.** Ed25519 is the right choice for TLS certs. Apple doesn't support it. Now we have two keys.
+
+**List queries aren't mode changes.** IRC protocol quirk from the 80s. MODE can mean "show me" or "change this" depending on parameters.
+
+**Flood control is 15 lines.** Token bucket, stdlib only. Add complexity when someone actually floods you.
+
+**Cloaking is one line.** Set hostname to server name. Done.
+
+**The network repo works.** Servers poll GitHub, find each other, federate. PRs are join requests. Git is the coordination layer.
 
 ## License
 
