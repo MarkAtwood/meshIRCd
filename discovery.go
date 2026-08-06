@@ -128,6 +128,7 @@ type Discovery struct {
 
 	mu     sync.RWMutex
 	config *CachedConfig
+	motd   []string // cached network MOTD lines
 	client *http.Client
 }
 
@@ -289,6 +290,59 @@ func (d *Discovery) saveCache(data []byte, etag string) error {
 
 	fetchTime := time.Now().Format(time.RFC3339)
 	return os.WriteFile(d.cachePath+".fetched", []byte(fetchTime), 0600)
+}
+
+// FetchMOTD fetches motd.txt from the same base URL as servers.json
+func (d *Discovery) FetchMOTD() error {
+	// Derive motd.txt URL from servers.json URL
+	motdURL := strings.TrimSuffix(d.url, "servers.json") + "motd.txt"
+
+	req, err := http.NewRequest("GET", motdURL, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	if d.token != "" {
+		req.Header.Set("Authorization", "Bearer "+d.token)
+	}
+	req.Header.Set("User-Agent", "meshircd/1.0")
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch motd: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// No network MOTD, that's fine
+		d.mu.Lock()
+		d.motd = nil
+		d.mu.Unlock()
+		return nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read motd: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	d.mu.Lock()
+	d.motd = lines
+	d.mu.Unlock()
+
+	return nil
+}
+
+// GetMOTD returns the cached network MOTD lines
+func (d *Discovery) GetMOTD() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.motd
 }
 
 // GetConfig returns the current config

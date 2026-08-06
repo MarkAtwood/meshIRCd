@@ -113,7 +113,22 @@ const (
 	ERR_NOPRIVILEGES     = "481"
 	ERR_UMODEUNKNOWNFLAG = "501"
 	ERR_USERSDONTMATCH   = "502"
-	RPL_METADATAEND      = "762"
+	// WATCH numerics
+	RPL_LOGON          = "600"
+	RPL_LOGOFF         = "601"
+	RPL_WATCHOFF       = "602"
+	RPL_WATCHSTAT      = "603"
+	RPL_NOWON          = "604"
+	RPL_NOWOFF         = "605"
+	RPL_WATCHLIST      = "606"
+	RPL_ENDOFWATCHLIST = "607"
+	// MONITOR numerics
+	RPL_MONONLINE      = "730"
+	RPL_MONOFFLINE     = "731"
+	RPL_MONLIST        = "732"
+	RPL_ENDOFMONLIST   = "733"
+	ERR_MONLISTFULL    = "734"
+	RPL_METADATAEND    = "762"
 )
 
 // Message represents a parsed IRC message
@@ -189,23 +204,28 @@ type Client struct {
 	identityVerified  bool        // true only if this server verified the identity proof
 	sasl              SASLSession // SASL authentication state
 	lastChallengeTime time.Time   // rate limiting for IDENTITY CHALLENGE
+	monitor           map[string]bool // MONITOR list (lowercase nicks)
+	watch             map[string]bool // WATCH list (lowercase nicks)
+	floodTokens       float64         // ponytail: token bucket, 5 msg/sec burst 10
+	floodLastTime     time.Time
 }
 
 func newClient(conn net.Conn, server *Server) *Client {
-	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-	if err != nil {
-		host = conn.RemoteAddr().String()
-	}
+	// Cloak all users with server name - no IP exposure
 	return &Client{
 		conn:       conn,
 		server:     server,
 		send:       make(chan string, 256),
-		hostname:   host,
+		hostname:   server.name,
 		modes:      make(map[rune]bool),
 		channels:   make(map[string]*Channel),
 		signon:     time.Now(),
 		lastActive: time.Now(),
 		caps:       make(map[string]bool),
+		monitor:       make(map[string]bool),
+		watch:         make(map[string]bool),
+		floodTokens:   10, // start with full bucket
+		floodLastTime: time.Now(),
 	}
 }
 
@@ -289,6 +309,18 @@ func (c *Client) readLoop() {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if parsed := ParseMessageWithTags(line); parsed != nil {
+			// ponytail: token bucket flood control, 5 msg/sec burst 10
+			now := time.Now()
+			c.floodTokens += now.Sub(c.floodLastTime).Seconds() * 5.0
+			if c.floodTokens > 10 {
+				c.floodTokens = 10
+			}
+			c.floodLastTime = now
+			if c.floodTokens < 1 {
+				continue // drop message
+			}
+			c.floodTokens--
+
 			c.mu.Lock()
 			c.lastActive = time.Now()
 			c.mu.Unlock()
@@ -743,7 +775,6 @@ func (ev evMode) handle(ch *Channel) {
 	}
 
 	if !ch.isOp(c) {
-		log.Printf("DEBUG 482 MODE: nick=%s chan=%s modeStr=%q params=%v", c.Nick(), ch.name, ev.modeStr, ev.params)
 		c.SendNumeric(ERR_CHANOPRIVSNEEDED, fmt.Sprintf("%s :You're not channel operator", ch.name))
 		return
 	}
@@ -901,7 +932,6 @@ func (ev evTopic) handle(ch *Channel) {
 	}
 
 	if ch.modes['t'] && !ch.isOp(c) {
-		log.Printf("DEBUG 482 TOPIC: nick=%s chan=%s", c.Nick(), ch.name)
 		c.SendNumeric(ERR_CHANOPRIVSNEEDED, fmt.Sprintf("%s :You're not channel operator", ch.name))
 		return
 	}
@@ -922,7 +952,6 @@ func (ev evKick) handle(ch *Channel) {
 	c := ev.client
 
 	if !ch.isOp(c) {
-		log.Printf("DEBUG 482 KICK: nick=%s chan=%s", c.Nick(), ch.name)
 		c.SendNumeric(ERR_CHANOPRIVSNEEDED, fmt.Sprintf("%s :You're not channel operator", ch.name))
 		return
 	}
@@ -959,7 +988,6 @@ func (ev evInvite) handle(ch *Channel) {
 	}
 
 	if ch.modes['i'] && !ch.isOp(c) {
-		log.Printf("DEBUG 482 INVITE: nick=%s chan=%s", c.Nick(), ch.name)
 		c.SendNumeric(ERR_CHANOPRIVSNEEDED, fmt.Sprintf("%s :You're not channel operator", ch.name))
 		return
 	}
@@ -1214,6 +1242,11 @@ func (s *Server) removeClient(c *Client) {
 		s.federation.BroadcastUserOffline(c, "Connection closed")
 	}
 
+	// Notify MONITOR/WATCH watchers before removing
+	if nick != "" {
+		s.notifyWatchers(c, false)
+	}
+
 	s.mu.Lock()
 	delete(s.clients, strings.ToLower(nick))
 	s.mu.Unlock()
@@ -1332,6 +1365,10 @@ func (s *Server) handleMessage(c *Client, msg *Message) {
 		s.handleIDENTITY(c, msg)
 	case "METADATA":
 		s.handleMETADATA(c, msg)
+	case "MONITOR":
+		s.handleMONITOR(c, msg)
+	case "WATCH":
+		s.handleWATCH(c, msg)
 	default:
 		c.SendNumeric(ERR_UNKNOWNCOMMAND, fmt.Sprintf("%s :Unknown command", msg.Command))
 	}
@@ -1513,13 +1550,59 @@ func (s *Server) tryRegister(c *Client) {
 	c.SendNumeric(RPL_YOURHOST, fmt.Sprintf(":Your host is %s, running version %s", s.name, serverVersion))
 	c.SendNumeric(RPL_CREATED, fmt.Sprintf(":This server was created %s", s.created.Format(time.RFC1123)))
 	c.SendNumeric(RPL_MYINFO, fmt.Sprintf("%s %s iowrs biklmnopstv bklov", s.name, serverVersion))
-	c.SendNumeric(RPL_ISUPPORT, "CASEMAPPING=ascii CHANTYPES=# CHANMODES=b,k,l,imnpst NICKLEN=30 CHANNELLEN=50 TOPICLEN=390 PREFIX=(ov)@+ NETWORK="+s.network+" CHATHISTORY=500 :are supported by this server")
+	c.SendNumeric(RPL_ISUPPORT, "CASEMAPPING=ascii CHANTYPES=# CHANMODES=b,k,l,imnpst NICKLEN=30 CHANNELLEN=50 TOPICLEN=390 PREFIX=(ov)@+ MONITOR=100 WATCH=100 NETWORK="+s.network+" CHATHISTORY=500 :are supported by this server")
 	s.handleLUSERS(c)
 	s.sendMOTD(c)
 
 	// Broadcast UserOnline to federation
 	if s.federation != nil {
 		s.federation.BroadcastUserOnline(c)
+	}
+
+	// Notify MONITOR/WATCH watchers
+	s.notifyWatchers(c, true)
+
+	// Auto-join default channel
+	s.handleJOIN(c, &Message{Command: "JOIN", Params: []string{"##"}})
+}
+
+// notifyWatchers sends MONITOR/WATCH notifications when a user comes online or goes offline
+func (s *Server) notifyWatchers(target *Client, online bool) {
+	targetNick := target.Nick()
+	targetNickLower := strings.ToLower(targetNick)
+
+	s.mu.RLock()
+	clients := make([]*Client, 0, len(s.clients))
+	for _, c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.RUnlock()
+
+	for _, c := range clients {
+		if c == target {
+			continue
+		}
+		c.mu.RLock()
+		inMonitor := c.monitor[targetNickLower]
+		inWatch := c.watch[targetNickLower]
+		c.mu.RUnlock()
+
+		if inMonitor {
+			if online {
+				c.SendNumeric(RPL_MONONLINE, ":"+targetNick)
+			} else {
+				c.SendNumeric(RPL_MONOFFLINE, ":"+targetNick)
+			}
+		}
+		if inWatch {
+			target.mu.RLock()
+			if online {
+				c.SendNumeric(RPL_LOGON, fmt.Sprintf("%s %s %s %d :logged on", targetNick, target.user, target.hostname, target.signon.Unix()))
+			} else {
+				c.SendNumeric(RPL_LOGOFF, fmt.Sprintf("%s %s %s %d :logged off", targetNick, target.user, target.hostname, target.signon.Unix()))
+			}
+			target.mu.RUnlock()
+		}
 	}
 }
 
@@ -1536,14 +1619,36 @@ func (s *Server) handleLUSERS(c *Client) {
 }
 
 func (s *Server) sendMOTD(c *Client) {
-	if len(s.motd) == 0 {
+	// Collect MOTD from network (federation) and local sources
+	var networkMOTD []string
+	if s.federation != nil && s.federation.discovery != nil {
+		networkMOTD = s.federation.discovery.GetMOTD()
+	}
+
+	if len(networkMOTD) == 0 && len(s.motd) == 0 {
 		c.SendNumeric(ERR_NOMOTD, ":MOTD File is missing")
 		return
 	}
+
 	c.SendNumeric(RPL_MOTDSTART, fmt.Sprintf(":- %s Message of the day -", s.name))
+
+	// Network MOTD first
+	for _, line := range networkMOTD {
+		c.SendNumeric(RPL_MOTD, ":- "+line)
+	}
+
+	// Separator if both exist
+	if len(networkMOTD) > 0 && len(s.motd) > 0 {
+		c.SendNumeric(RPL_MOTD, ":- ")
+		c.SendNumeric(RPL_MOTD, ":- === Local Server Info ===")
+		c.SendNumeric(RPL_MOTD, ":- ")
+	}
+
+	// Local MOTD
 	for _, line := range s.motd {
 		c.SendNumeric(RPL_MOTD, ":- "+line)
 	}
+
 	c.SendNumeric(RPL_ENDOFMOTD, ":End of MOTD command")
 }
 
@@ -2244,6 +2349,171 @@ func (s *Server) handleUSERHOST(c *Client, msg *Message) {
 	c.SendNumeric(RPL_USERHOST, ":"+strings.Join(results, " "))
 }
 
+const monitorLimit = 100 // max nicks per client
+
+func (s *Server) handleMONITOR(c *Client, msg *Message) {
+	if len(msg.Params) == 0 {
+		c.SendNumeric(ERR_NEEDMOREPARAMS, "MONITOR :Not enough parameters")
+		return
+	}
+
+	cmd := strings.ToUpper(msg.Params[0])
+	switch cmd {
+	case "+":
+		// Add nicks to monitor list
+		if len(msg.Params) < 2 {
+			return
+		}
+		nicks := strings.Split(msg.Params[1], ",")
+		var online, offline []string
+		c.mu.Lock()
+		for _, nick := range nicks {
+			nick = strings.TrimSpace(nick)
+			if nick == "" {
+				continue
+			}
+			if len(c.monitor) >= monitorLimit {
+				c.mu.Unlock()
+				c.SendNumeric(ERR_MONLISTFULL, fmt.Sprintf("%d %s :Monitor list is full", monitorLimit, nick))
+				return
+			}
+			c.monitor[strings.ToLower(nick)] = true
+			if target := s.getClient(nick); target != nil {
+				online = append(online, target.Nick())
+			} else {
+				offline = append(offline, nick)
+			}
+		}
+		c.mu.Unlock()
+		if len(online) > 0 {
+			c.SendNumeric(RPL_MONONLINE, ":"+strings.Join(online, ","))
+		}
+		if len(offline) > 0 {
+			c.SendNumeric(RPL_MONOFFLINE, ":"+strings.Join(offline, ","))
+		}
+
+	case "-":
+		// Remove nicks from monitor list
+		if len(msg.Params) < 2 {
+			return
+		}
+		nicks := strings.Split(msg.Params[1], ",")
+		c.mu.Lock()
+		for _, nick := range nicks {
+			delete(c.monitor, strings.ToLower(strings.TrimSpace(nick)))
+		}
+		c.mu.Unlock()
+
+	case "C":
+		// Clear monitor list
+		c.mu.Lock()
+		c.monitor = make(map[string]bool)
+		c.mu.Unlock()
+
+	case "L":
+		// List monitored nicks
+		c.mu.RLock()
+		nicks := make([]string, 0, len(c.monitor))
+		for nick := range c.monitor {
+			nicks = append(nicks, nick)
+		}
+		c.mu.RUnlock()
+		if len(nicks) > 0 {
+			c.SendNumeric(RPL_MONLIST, ":"+strings.Join(nicks, ","))
+		}
+		c.SendNumeric(RPL_ENDOFMONLIST, ":End of MONITOR list")
+
+	case "S":
+		// Status - report online/offline for all monitored
+		c.mu.RLock()
+		var online, offline []string
+		for nick := range c.monitor {
+			if target := s.getClient(nick); target != nil {
+				online = append(online, target.Nick())
+			} else {
+				offline = append(offline, nick)
+			}
+		}
+		c.mu.RUnlock()
+		if len(online) > 0 {
+			c.SendNumeric(RPL_MONONLINE, ":"+strings.Join(online, ","))
+		}
+		if len(offline) > 0 {
+			c.SendNumeric(RPL_MONOFFLINE, ":"+strings.Join(offline, ","))
+		}
+	}
+}
+
+func (s *Server) handleWATCH(c *Client, msg *Message) {
+	if len(msg.Params) == 0 {
+		c.SendNumeric(ERR_NEEDMOREPARAMS, "WATCH :Not enough parameters")
+		return
+	}
+
+	// WATCH uses +nick/-nick format or single letter commands
+	arg := msg.Params[0]
+
+	switch strings.ToUpper(arg) {
+	case "L", "l":
+		// List watched nicks with status
+		c.mu.RLock()
+		for nick := range c.watch {
+			if target := s.getClient(nick); target != nil {
+				target.mu.RLock()
+				c.SendNumeric(RPL_NOWON, fmt.Sprintf("%s %s %s %d :is online", target.Nick(), target.user, target.hostname, target.signon.Unix()))
+				target.mu.RUnlock()
+			} else {
+				c.SendNumeric(RPL_NOWOFF, fmt.Sprintf("%s * * 0 :is offline", nick))
+			}
+		}
+		c.mu.RUnlock()
+		c.SendNumeric(RPL_ENDOFWATCHLIST, ":End of WATCH l")
+
+	case "C", "c":
+		// Clear watch list
+		c.mu.Lock()
+		c.watch = make(map[string]bool)
+		c.mu.Unlock()
+
+	case "S", "s":
+		// Stats
+		c.mu.RLock()
+		count := len(c.watch)
+		c.mu.RUnlock()
+		c.SendNumeric(RPL_WATCHSTAT, fmt.Sprintf(":You have %d entries in your watch list", count))
+
+	default:
+		// +nick or -nick format
+		for _, param := range msg.Params {
+			if len(param) < 2 {
+				continue
+			}
+			op := param[0]
+			nick := param[1:]
+			nickLower := strings.ToLower(nick)
+
+			switch op {
+			case '+':
+				c.mu.Lock()
+				c.watch[nickLower] = true
+				c.mu.Unlock()
+				if target := s.getClient(nick); target != nil {
+					target.mu.RLock()
+					c.SendNumeric(RPL_NOWON, fmt.Sprintf("%s %s %s %d :is online", target.Nick(), target.user, target.hostname, target.signon.Unix()))
+					target.mu.RUnlock()
+				} else {
+					c.SendNumeric(RPL_NOWOFF, fmt.Sprintf("%s * * 0 :is offline", nick))
+				}
+			case '-':
+				c.mu.Lock()
+				delete(c.watch, nickLower)
+				c.mu.Unlock()
+				c.SendNumeric(RPL_WATCHOFF, fmt.Sprintf("%s * * 0 :stopped watching", nick))
+			}
+		}
+	}
+}
+
 func (s *Server) handleOPER(c *Client, msg *Message) {
 	if len(msg.Params) < 2 {
 		c.SendNumeric(ERR_NEEDMOREPARAMS, "OPER :Not enough parameters")
@@ -2802,10 +3072,22 @@ func main() {
 
 	server := newServer(serverName, networkName, *password, *operPass)
 
-	if *motdFile != "" {
-		data, err := os.ReadFile(*motdFile)
+	// Load local MOTD: flag > env var > default path
+	motdPath := *motdFile
+	if motdPath == "" {
+		motdPath = os.Getenv("MESHIRCD_MOTD")
+	}
+	if motdPath == "" {
+		// Try default path
+		defaultMOTD := dataPath + "/motd.txt"
+		if _, err := os.Stat(defaultMOTD); err == nil {
+			motdPath = defaultMOTD
+		}
+	}
+	if motdPath != "" {
+		data, err := os.ReadFile(motdPath)
 		if err == nil {
-			server.motd = strings.Split(string(data), "\n")
+			server.motd = strings.Split(strings.TrimSpace(string(data)), "\n")
 		}
 	}
 

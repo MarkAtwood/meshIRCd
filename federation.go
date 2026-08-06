@@ -193,6 +193,11 @@ func (fm *FederationManager) Start() error {
 		log.Printf("federation: failed to fetch config: %v (using cached)", err)
 	}
 
+	// Fetch network MOTD
+	if err := fm.discovery.FetchMOTD(); err != nil {
+		log.Printf("federation: failed to fetch network MOTD: %v", err)
+	}
+
 	// Connect to peers
 	fm.syncPeers()
 
@@ -227,6 +232,10 @@ func (fm *FederationManager) pollLoop() {
 			if changed {
 				log.Printf("federation: config changed, syncing peers")
 				fm.syncPeers()
+			}
+			// Also refresh MOTD
+			if err := fm.discovery.FetchMOTD(); err != nil {
+				log.Printf("federation: failed to fetch network MOTD: %v", err)
 			}
 		}
 	}
